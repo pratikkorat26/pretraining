@@ -1,8 +1,8 @@
 # ReadableLM — Decoder-Only Transformer from Scratch
 
-A production-ready, OLMo3/LLaMA-style decoder-only language model implemented from scratch in ~800 lines of PyTorch, with **readability** and **correctness** as first-class goals.
+A production-ready, OLMo3/LLaMA-style decoder-only language model implemented from scratch in PyTorch, with **readability** and **correctness** as first-class goals.
 
-Fully native to the HuggingFace ecosystem — `save_pretrained()`, `from_pretrained()`, and `model.generate()` work out of the box with zero external dependencies beyond PyTorch and Transformers.
+Fully native to the HuggingFace ecosystem — `save_pretrained()`, `from_pretrained()`, and `model.generate()` work out of the box. Includes a complete streaming training pipeline for single-GPU pretraining.
 
 ---
 
@@ -10,14 +10,14 @@ Fully native to the HuggingFace ecosystem — `save_pretrained()`, `from_pretrai
 
 | Capability | Details |
 |---|---|
-| **Attention** | Dual-backend: Flash Attention via PyTorch SDPA (default) + eager matmul→softmax fallback |
-| **GQA** | Grouped-Query Attention — `num_kv_heads < num_heads` with `repeat_kv` expansion |
+| **Attention** | Dual-backend: Flash Attention via PyTorch SDPA (default) + eager fallback |
+| **GQA** | Grouped-Query Attention with `repeat_kv` expansion |
 | **RoPE** | Rotary Position Embeddings with configurable `rope_theta` |
 | **Gated MLP** | SwiGLU activation: `down(silu(gate(x)) ⊙ up(x))` |
 | **Normalization** | RMSNorm (pre-norm residuals, OLMo3/LLaMA ordering) |
-| **KV Cache** | Correct prefill + incremental decode, compatible with HF's `DynamicCache` |
-| **Training** | Causal LM loss with label masking (`ignore_index=-100`) |
-| **Generation** | Full `GenerationMixin` support — greedy, sampling, beam search |
+| **KV Cache** | Correct prefill + decode, compatible with HF's `DynamicCache` |
+| **Training** | HF Trainer with streaming data, token packing, custom optimizer |
+| **Generation** | Full `GenerationMixin` — greedy, sampling, beam search |
 
 ## Architecture
 
@@ -52,92 +52,159 @@ input_ids
 
 ```
 pretraining/
-├── configuration_readable_lm.py   # ReadableLMConfig (PretrainedConfig)
-├── modeling_readable_lm.py        # Full model implementation
-│   ├── repeat_kv()                #   GQA head expansion
-│   ├── RMSNorm                    #   Root-mean-square normalization
-│   ├── RotaryEmbedding            #   RoPE cos/sin precomputation
-│   ├── apply_rotary_pos_emb()     #   RoPE rotation application
-│   ├── ReadableAttention          #   SDPA / eager attention + KV cache
-│   ├── ReadableMLP                #   SwiGLU gated MLP
-│   ├── ReadableDecoderLayer       #   Pre-norm residual block
-│   ├── ReadableLMModel            #   Base model (→ BaseModelOutputWithPast)
-│   └── ReadableLMForCausalLM      #   CausalLM head (→ CausalLMOutputWithPast)
-├── train_minimal.py               # Training loop + save/load + generate
+│
+│  ── Model ──────────────────────────────────────────────
+├── configuration_readable_lm.py   # ReadableLMConfig
+├── modeling_readable_lm.py        # Full model (RMSNorm, RoPE, GQA, SwiGLU, etc.)
+│
+│  ── Training Pipeline ──────────────────────────────────
+├── train_streaming.py             # Main training script (HF Trainer)
+├── data_streaming.py              # Streaming dataset + 4K token packing
+├── collator.py                    # Minimal stacking collator
+├── callbacks.py                   # Generation + token count callbacks
+│
+│  ── Testing & Demos ────────────────────────────────────
+├── train_minimal.py               # Quick demo: train on dummy data
 ├── test_kv_cache_equivalence.py   # KV cache correctness test
 └── README.md
 ```
+
+---
 
 ## Quick Start
 
 ### Install
 
 ```bash
-pip install torch transformers
+pip install torch transformers datasets
 ```
 
-### Run Tests
+### Run KV Cache Tests
 
 ```bash
 python test_kv_cache_equivalence.py
 ```
 
-Verifies that full-sequence forward and prefill+decode produce identical logits (within `atol=1e-5`), including multi-step decode consistency.
-
-### Train + Generate
+### Quick Demo (CPU, ~30 seconds)
 
 ```bash
 python train_minimal.py
 ```
 
-Trains a small model on dummy data, saves to `./output_readable_lm/`, reloads from disk, and runs deterministic generation — proving the full save/load/generate pipeline works end-to-end.
+Trains a tiny model on dummy data, saves to disk, reloads, and generates text — proving the full HF pipeline works.
+
+---
+
+## Production Training
+
+### Single-GPU Pretraining
+
+```bash
+python train_streaming.py
+```
+
+This launches a full training run with:
+- **Streaming data** from `allenai/c4` (never loads into memory)
+- **4K token packing** (no padding waste)
+- **~250M parameter** model with GQA
+- **Gradient checkpointing** for VRAM efficiency
+- **bf16 mixed precision**
+- **Cosine LR** with linear warmup
+
+### Expected VRAM Usage
+
+| Component | VRAM |
+|---|---|
+| Model parameters (bf16) | ~500 MB |
+| Gradient checkpointing activations | ~1-2 GB |
+| Optimizer states (AdamW, fp32) | ~2 GB |
+| Gradients + buffer | ~1-2 GB |
+| **Total** | **~5-6 GB** |
+
+Fits comfortably on an 8GB GPU (RTX 4070, RTX 3070, etc.).
+
+### How Streaming Works
 
 ```
-Epoch 1/3   avg_loss=6.33
-Epoch 2/3   avg_loss=1.04
-Epoch 3/3   avg_loss=0.07
-
-Prompt:    'Attention is'
-Generated: 'Attention is all you need to build great language models.'
+HuggingFace Hub          data_streaming.py           Trainer
+     │                        │                        │
+     │  ──stream──→  Tokenize on the fly               │
+     │                        │                        │
+     │               Pack into 4096-token chunks        │
+     │                        │                        │
+     │                collator.py stacks batch          │
+     │                        │                        │
+     │                        └────→ Forward + backward │
 ```
 
-### Switch Attention Backend
+1. `datasets.load_dataset(..., streaming=True)` fetches data in small chunks
+2. Each document is tokenized and appended to a token buffer
+3. When the buffer reaches 4096 tokens, a sample is emitted
+4. Remainder tokens are dropped (no padding, ever)
+5. A shuffle buffer of 10K examples provides randomness
 
-```python
-from configuration_readable_lm import ReadableLMConfig
-from modeling_readable_lm import ReadableLMForCausalLM
+### Resume from Checkpoint
 
-# Default: SDPA (auto-dispatches to FlashAttention-2 on supported GPUs)
-config = ReadableLMConfig(attn_implementation="sdpa")
-
-# Fallback: explicit matmul → softmax (useful for debugging)
-config = ReadableLMConfig(attn_implementation="eager")
-
-model = ReadableLMForCausalLM(config)
+```bash
+python train_streaming.py --resume_from_checkpoint output/checkpoint-5000
 ```
+
+The Trainer saves checkpoints every 5,000 steps (configurable), keeping the last 2. Resume picks up optimizer state, LR schedule, and global step count.
+
+### Change Dataset
+
+```bash
+# Use FineWeb-Edu (10B token sample)
+python train_streaming.py --dataset_name="HuggingFaceFW/fineweb-edu" \
+                          --dataset_config="sample-10BT"
+
+# Use The Pile
+python train_streaming.py --dataset_name="EleutherAI/the_pile" \
+                          --dataset_config=None
+```
+
+Any HuggingFace dataset with a `text` column works out of the box.
+
+### Training Configuration
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| Batch size | 1 × 16 accum = 16 effective | Fits 8GB VRAM |
+| Sequence length | 4096 | Standard for modern LLMs |
+| Tokens/step | 65,536 | 16 × 4096 |
+| Total steps | 300,000 | ~20B tokens |
+| Warmup | 3,000 steps (1%) | Standard cosine warmup |
+| Body LR | 2e-4 | Standard for 250M models |
+| Embedding LR | 1e-4 | Lower to stabilize lookup tables |
+| Weight decay | 0.1 (body only) | No decay on embeddings |
+| Grad clip | 1.0 | Prevents spikes |
+
+---
 
 ## Design Decisions
 
 | Decision | Rationale |
 |---|---|
-| **Pre-norm residuals** | `x + attn(norm(x))` — matches OLMo3, LLaMA, Mistral; more stable than post-norm at scale |
-| **SwiGLU over GELU** | ~1% better quality per FLOP (Shazeer 2020); standard in modern LLMs |
-| **GQA over MHA** | Reduces KV cache memory proportional to group ratio with minimal quality loss |
-| **RoPE over learned positional** | Extrapolates to longer sequences; no embedding table overhead |
-| **SDPA default** | Zero-cost abstraction — same API, but FlashAttention-2 kernel when available |
-| **`masked_fill` for mask construction** | Avoids `0 × -inf = NaN` (IEEE 754) — a subtle but critical correctness detail |
-| **DynamicCache + legacy tuple compat** | Works seamlessly with both HF v4.50+ (`DynamicCache`) and older versions |
+| **Pre-norm residuals** | `x + attn(norm(x))` — matches OLMo3, LLaMA, Mistral |
+| **SwiGLU over GELU** | ~1% better quality per FLOP (Shazeer 2020) |
+| **GQA over MHA** | Reduces KV cache memory proportional to group ratio |
+| **RoPE over learned** | Extrapolates to longer sequences; no embedding table |
+| **SDPA default** | Flash Attention kernel when available, zero API change |
+| **`masked_fill` masks** | Avoids `0 × -inf = NaN` (IEEE 754) correctness bug |
+| **Token packing** | No padding waste — 100% of compute goes to real tokens |
+| **Streaming data** | Constant memory regardless of dataset size |
+| **Per-group LR** | Embeddings are lookup tables — need lower LR, no decay |
 
 ## What's Intentionally Omitted
 
-These are deliberate scope cuts for readability, not oversights:
+Deliberate scope cuts for readability:
 
-- Sliding-window / chunked attention masks
+- Sliding-window / chunked attention
 - Dynamic NTK-aware / YaRN RoPE scaling
-- Gradient checkpointing
-- Tensor-parallel sharding annotations
-- Tokenizer training (uses existing GPT-2 tokenizer)
-- Multi-GPU / FSDP setup
+- Tensor-parallel / FSDP distributed training
+- DeepSpeed integration
+- Multi-dataset mixing
+- Tokenizer training
 
 ## License
 

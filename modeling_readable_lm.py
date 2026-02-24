@@ -340,6 +340,7 @@ class ReadableAttention(nn.Module):
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
+        is_causal: bool = False,
     ) -> torch.Tensor:
         """
         PyTorch SDPA — auto-dispatches to FlashAttention-2 or memory-efficient
@@ -348,23 +349,11 @@ class ReadableAttention(nn.Module):
         All inputs are (batch, num_heads, seq_len, head_dim) after GQA expansion.
         Returns (batch, num_heads, q_len, head_dim).
         """
-        # SDPA can use is_causal=True for faster path when no padding mask is needed
-        # (all mask values are 0, meaning no padding tokens are masked).
-        # When a padding mask is present (some values are -inf), we must pass it explicitly.
-        is_causal = False
-        sdpa_mask = attention_mask
-        if attention_mask is not None:
-            has_padding = torch.isinf(attention_mask).any()
-            if not has_padding:
-                # Pure causal mask with no padding — let SDPA handle it natively
-                is_causal = (query_states.shape[2] > 1)  # causal only for prefill, not single-token decode
-                sdpa_mask = None
-
         return F.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
-            attn_mask=sdpa_mask,
+            attn_mask=attention_mask,
             is_causal=is_causal,
         )
 
@@ -373,8 +362,11 @@ class ReadableAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
+        is_causal: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -389,8 +381,9 @@ class ReadableAttention(nn.Module):
         value_states = value_states.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         # --- Apply RoPE ---
-        cos, sin = self.rotary_emb(position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if rope_cos is None or rope_sin is None:
+            rope_cos, rope_sin = self.rotary_emb(position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, rope_cos, rope_sin)
 
         # --- KV cache: concatenate past keys/values ---
         if past_key_value is not None:
@@ -406,7 +399,13 @@ class ReadableAttention(nn.Module):
 
         # --- Dispatch to attention backend ---
         if self.attn_implementation == "sdpa":
-            attention_output = self._sdpa_attention(query_states, key_states, value_states, attention_mask)
+            attention_output = self._sdpa_attention(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                is_causal=is_causal,
+            )
         else:
             attention_output = self._eager_attention(query_states, key_states, value_states, attention_mask)
         # attention_output shape: (batch, num_heads, q_len, head_dim)
@@ -487,8 +486,11 @@ class ReadableDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
+        is_causal: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # --- Self-attention block ---
         residual = hidden_states
@@ -497,8 +499,11 @@ class ReadableDecoderLayer(nn.Module):
             hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
             past_key_value=past_key_value,
             use_cache=use_cache,
+            is_causal=is_causal,
         )
         hidden_states = residual + attention_output
 
@@ -537,7 +542,7 @@ class ReadableLMModel(PreTrainedModel):
 
     config_class = ReadableLMConfig
     base_model_prefix = "model"
-    supports_gradient_checkpointing = False  # TODO: add gradient checkpointing
+    supports_gradient_checkpointing = True
 
     def __init__(self, config: ReadableLMConfig):
         super().__init__(config)
@@ -547,8 +552,15 @@ class ReadableLMModel(PreTrainedModel):
         )
         self.final_norm = RMSNorm(config.hidden_size, epsilon=config.rms_norm_epsilon)
 
+        self.gradient_checkpointing = False
+
         # Weight initialisation (HF convention)
         self.post_init()
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        """Called by gradient_checkpointing_enable/disable."""
+        if isinstance(module, ReadableLMModel):
+            module.gradient_checkpointing = value
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -610,6 +622,24 @@ class ReadableLMModel(PreTrainedModel):
 
         return causal_mask
 
+    @staticmethod
+    def _should_use_sdpa_causal_fast_path(
+        attention_mask: Optional[torch.Tensor],
+        attn_implementation: str,
+    ) -> bool:
+        """
+        Return True when SDPA can safely use `is_causal=True` and no explicit mask.
+
+        This requires:
+          - SDPA backend
+          - No padding mask (None or all ones)
+        """
+        if attn_implementation != "sdpa":
+            return False
+        if attention_mask is None:
+            return True
+        return bool(torch.all(attention_mask != 0))
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -620,6 +650,10 @@ class ReadableLMModel(PreTrainedModel):
     ) -> BaseModelOutputWithPast:
         batch_size, seq_len = input_ids.shape
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+        # KV cache is useful for autoregressive decode, but slows down
+        # full-sequence training where cache outputs are not consumed.
+        if self.training and past_key_values is None:
+            use_cache = False
 
         # --- Compute past length for position_ids and mask ---
         past_length = _get_cache_length(past_key_values)
@@ -630,39 +664,73 @@ class ReadableLMModel(PreTrainedModel):
                 past_length, past_length + seq_len, device=input_ids.device
             ).unsqueeze(0).expand(batch_size, -1)
 
-        # --- Build combined causal + padding mask ---
+        # --- Build attention mask ---
         key_value_length = past_length + seq_len
-
-        # Expand attention_mask to cover full kv length if provided
-        if attention_mask is not None and attention_mask.shape[1] < key_value_length:
-            # During generation, HF may pass the full-length attention_mask;
-            # this branch handles edge cases.
-            pad_len = key_value_length - attention_mask.shape[1]
-            attention_mask = F.pad(attention_mask, (pad_len, 0), value=1)
-
-        combined_mask = self._make_causal_mask(
-            query_length=seq_len,
-            key_value_length=key_value_length,
-            dtype=self.embed_tokens.weight.dtype,
-            device=input_ids.device,
+        use_sdpa_fast_path = self._should_use_sdpa_causal_fast_path(
             attention_mask=attention_mask,
+            attn_implementation=self.config.attn_implementation,
         )
+
+        # SDPA fast path: avoid building large additive masks when no padding exists.
+        # For single-token decode, `is_causal=False` is required so the query can
+        # attend to the entire KV cache.
+        is_causal = use_sdpa_fast_path and (seq_len > 1)
+        combined_mask = None
+
+        if not use_sdpa_fast_path:
+            # Expand attention_mask to cover full kv length if provided
+            if attention_mask is not None and attention_mask.shape[1] < key_value_length:
+                # During generation, HF may pass the full-length attention_mask;
+                # this branch handles edge cases.
+                pad_len = key_value_length - attention_mask.shape[1]
+                attention_mask = F.pad(attention_mask, (pad_len, 0), value=1)
+
+            combined_mask = self._make_causal_mask(
+                query_length=seq_len,
+                key_value_length=key_value_length,
+                dtype=self.embed_tokens.weight.dtype,
+                device=input_ids.device,
+                attention_mask=attention_mask,
+            )
 
         # --- Embedding ---
         hidden_states = self.embed_tokens(input_ids)
+        rope_cos = rope_sin = None
+        if len(self.layers) > 0:
+            rope_cos, rope_sin = self.layers[0].self_attention.rotary_emb(position_ids)
 
         # --- Pass through decoder layers ---
         new_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
         for layer_idx, layer in enumerate(self.layers):
             layer_past = _get_layer_cache(past_key_values, layer_idx)
 
-            hidden_states, present_key_value = layer(
-                hidden_states,
-                attention_mask=combined_mask,
-                position_ids=position_ids,
-                past_key_value=layer_past,
-                use_cache=use_cache,
-            )
+            if self.gradient_checkpointing and self.training:
+                # Gradient checkpointing trades compute for memory:
+                # don't store intermediate activations, recompute them
+                # during backward.  Disabled when use_cache=True (inference).
+                hidden_states, present_key_value = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    hidden_states,
+                    combined_mask,
+                    position_ids,
+                    rope_cos,
+                    rope_sin,
+                    layer_past,
+                    use_cache,
+                    is_causal,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states, present_key_value = layer(
+                    hidden_states,
+                    attention_mask=combined_mask,
+                    position_ids=position_ids,
+                    rope_cos=rope_cos,
+                    rope_sin=rope_sin,
+                    past_key_value=layer_past,
+                    use_cache=use_cache,
+                    is_causal=is_causal,
+                )
             if use_cache:
                 new_key_values.append(present_key_value)
 
