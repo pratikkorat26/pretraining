@@ -1,21 +1,22 @@
 """
 train_minimal.py
 ----------------
-Minimal training loop for ReadableLM on a tiny dummy dataset.
+Minimal training script for ReadableLM using the HuggingFace Trainer API.
+
+Demonstrates that ReadableLM is a fully HF-native model — it plugs directly
+into the standard Trainer pipeline with zero custom training code.
 
 Usage:
     python train_minimal.py
 
 What it does:
-  1. Builds a tiny ReadableLM config (fast to train on CPU).
-  2. Loads the GPT-2 tokenizer (or any AutoTokenizer target).
-  3. Creates a small dummy dataset of repeated short sentences.
-  4. Runs a simple PyTorch training loop (no Trainer dependency).
-  5. Saves the model + config to output_dir.
-  6. Reloads from output_dir and runs model.generate() to prove
-     save/load + generation work end-to-end.
-
-No GPU required — this is intentionally tiny.
+  1. Loads GPT-2 tokenizer (sets pad_token = eos_token).
+  2. Builds a small ReadableLM from a fresh config.
+  3. Creates a tiny dummy dataset of tokenized sentences.
+  4. Trains with HuggingFace Trainer (causal LM objective).
+  5. Saves model + tokenizer via save_pretrained().
+  6. Reloads from disk and runs model.generate() to prove
+     the full save/load/generate pipeline works.
 """
 
 import os
@@ -25,8 +26,13 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 
 import torch
-from torch.utils.data import DataLoader, Dataset
-from transformers import AutoTokenizer
+from transformers import (
+    AutoTokenizer,
+    Trainer,
+    TrainingArguments,
+    DataCollatorForLanguageModeling,
+)
+from torch.utils.data import Dataset
 
 from configuration_readable_lm import ReadableLMConfig
 from modeling_readable_lm import ReadableLMForCausalLM
@@ -35,12 +41,8 @@ from modeling_readable_lm import ReadableLMForCausalLM
 # Config
 # ---------------------------------------------------------------------------
 
-OUTPUT_DIR      = "output_readable_lm"
-MAX_SEQ_LEN     = 64
-BATCH_SIZE      = 4
-NUM_EPOCHS      = 10
-LEARNING_RATE   = 3e-4
-DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
+OUTPUT_DIR  = "output_readable_lm"
+MAX_SEQ_LEN = 64
 
 CORPUS = [
     "The quick brown fox jumps over the lazy dog.",
@@ -60,43 +62,34 @@ CORPUS = [
 
 class TinyTextDataset(Dataset):
     """
-    Tokenises a list of strings and returns fixed-length (MAX_SEQ_LEN)
-    input_ids + labels tensors.  Labels equal input_ids (standard causal LM).
+    Tokenises a list of strings and returns fixed-length input_ids.
 
-    Sequences shorter than MAX_SEQ_LEN are padded with the pad token;
-    labels at pad positions are set to -100 so the loss ignores them.
+    The HF DataCollatorForLanguageModeling will handle creating labels
+    (clone of input_ids with pad positions set to -100) automatically.
     """
 
-    def __init__(self, texts: list[str], tokenizer, max_len: int):
-        self.tokenizer = tokenizer
-        self.max_len   = max_len
-        # Repeat corpus so we have a few hundred examples
-        self.texts = texts * 30
+    def __init__(self, texts: list[str], tokenizer, max_len: int, repeats: int = 30):
+        self.samples = []
+        expanded = texts * repeats  # repeat corpus for more training data
+
+        for text in expanded:
+            tokens = tokenizer(
+                text,
+                max_length=max_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            self.samples.append({
+                "input_ids": tokens["input_ids"].squeeze(0),
+                "attention_mask": tokens["attention_mask"].squeeze(0),
+            })
 
     def __len__(self) -> int:
-        return len(self.texts)
+        return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        text   = self.texts[idx]
-        tokens = self.tokenizer(
-            text,
-            max_length=self.max_len,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        input_ids      = tokens["input_ids"].squeeze(0)      # (max_len,)
-        attention_mask = tokens["attention_mask"].squeeze(0) # (max_len,)
-
-        # Mask pad tokens in labels so they don't contribute to loss
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
-
-        return {
-            "input_ids":      input_ids,
-            "attention_mask": attention_mask,
-            "labels":         labels,
-        }
+        return self.samples[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -105,88 +98,103 @@ class TinyTextDataset(Dataset):
 
 
 def main() -> None:
-    print(f"Training on device: {DEVICE}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Training on device: {device}")
 
-    # ── Tokenizer ────────────────────────────────────────────────────────────
+    # ── Tokenizer ─────────────────────────────────────────────────────────
     print("Loading tokenizer (gpt2)…")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
-    # GPT-2 has no pad token by default; set it to eos so padding works.
+    # GPT-2 has no pad token by default; setting it to eos is standard practice.
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         print(f"  Set pad_token = eos_token = '{tokenizer.eos_token}'")
 
-    # ── Model ─────────────────────────────────────────────────────────────────
+    # ── Model ─────────────────────────────────────────────────────────────
     config = ReadableLMConfig(
-        vocab_size=len(tokenizer),       # match tokenizer
+        vocab_size=len(tokenizer),
         hidden_size=256,
         num_hidden_layers=4,
         num_attention_heads=8,
         num_key_value_heads=4,
         intermediate_size=512,
         max_position_embeddings=MAX_SEQ_LEN,
+        attn_implementation="sdpa",
         pad_token_id=tokenizer.pad_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
-    model = ReadableLMForCausalLM(config).to(DEVICE)
+    model = ReadableLMForCausalLM(config)
+    model = torch.compile(model)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {num_params:,}")
 
-    # ── Data ──────────────────────────────────────────────────────────────────
-    dataset    = TinyTextDataset(CORPUS, tokenizer, max_len=MAX_SEQ_LEN)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    # ── Dataset ───────────────────────────────────────────────────────────
+    dataset = TinyTextDataset(CORPUS, tokenizer, max_len=MAX_SEQ_LEN)
+    print(f"Dataset: {len(dataset)} samples, max_length={MAX_SEQ_LEN}")
 
-    # ── Optimiser ─────────────────────────────────────────────────────────────
-    optimiser = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    # ── HuggingFace Trainer ───────────────────────────────────────────────
+    # DataCollatorForLanguageModeling automatically creates `labels` from
+    # `input_ids` and masks pad tokens with -100 for causal LM training.
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,  # causal LM — not masked language modelling
+    )
 
-    # ── Training loop ─────────────────────────────────────────────────────────
-    model.train()
-    for epoch in range(1, NUM_EPOCHS + 1):
-        total_loss = 0.0
-        for step, batch in enumerate(dataloader):
-            input_ids      = batch["input_ids"].to(DEVICE)
-            attention_mask = batch["attention_mask"].to(DEVICE)
-            labels         = batch["labels"].to(DEVICE)
+    training_args = TrainingArguments(
+        output_dir=OUTPUT_DIR,
+        num_train_epochs=10,
+        per_device_train_batch_size=8,
+        learning_rate=3e-4,
+        weight_decay=0.01,
+        max_grad_norm=1.0,
+        logging_steps=10,
+        save_strategy="no",        # we save manually after training
+        report_to="none",          # disable wandb / tensorboard
+        seed=42,
+        fp16=False,
+        bf16=(device == "cuda"),   # use bf16 on GPU for speed
+        # torch.compile wraps the model in OptimizedModule, which hides
+        # the forward() signature from Trainer's column auto-detection.
+        # Setting this to False ensures all dataset columns are kept.
+        remove_unused_columns=False,
+    )
 
-            output = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-            )
-            loss = output.loss
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        data_collator=data_collator,
+    )
 
-            optimiser.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimiser.step()
+    print("\nStarting HF Trainer…")
+    trainer.train()
 
-            total_loss += loss.item()
-
-        avg_loss = total_loss / len(dataloader)
-        print(f"  Epoch {epoch}/{NUM_EPOCHS}  avg_loss={avg_loss:.4f}")
-
-    # ── Save ──────────────────────────────────────────────────────────────────
+    # ── Save ──────────────────────────────────────────────────────────────
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     model.save_pretrained(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
     print(f"\nModel saved to '{OUTPUT_DIR}'")
 
-    # ── Reload + generate ────────────────────────────────────────────────────
+    # ── Reload + generate ─────────────────────────────────────────────────
     print("\nReloading model from disk and running generation…")
-    reloaded_model = ReadableLMForCausalLM.from_pretrained(OUTPUT_DIR).to(DEVICE)
+    reloaded_model = ReadableLMForCausalLM.from_pretrained(OUTPUT_DIR).to(device)
     reloaded_tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR)
     reloaded_model.eval()
 
+    if reloaded_tokenizer.pad_token is None:
+        reloaded_tokenizer.pad_token = reloaded_tokenizer.eos_token
+
     prompt = "Attention is"
-    prompt_ids = reloaded_tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
+    prompt_ids = reloaded_tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
     with torch.no_grad():
         generated_ids = reloaded_model.generate(
             prompt_ids,
             max_new_tokens=20,
-            do_sample=False,          # greedy — deterministic
+            do_sample=False,
             use_cache=True,
+            pad_token_id=reloaded_tokenizer.pad_token_id,
         )
 
     generated_text = reloaded_tokenizer.decode(generated_ids[0], skip_special_tokens=True)
